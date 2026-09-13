@@ -1,0 +1,2 @@
+# Escaner-
+Checador de caducidad 
