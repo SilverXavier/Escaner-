@@ -11,7 +11,9 @@
 
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.10/index.global.min.css">
     <script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.10/index.global.min.js"></script>
-    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    
+    <!-- Librería Quagga2 optimizada para EAN-13 / UPC (Fallback) -->
+    <script src="https://cdn.jsdelivr.net/npm/@ericblade/quagga2/dist/quagga.min.js"></script>
 
     <style>
         :root {
@@ -75,11 +77,23 @@
             overflow-y: auto;
         }
 
-        #reader {
+        #interactive {
             width: 100%;
+            height: 220px;
             background: #000;
             border-radius: 8px;
             overflow: hidden;
+            position: relative;
+        }
+
+        #interactive video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+
+        #interactive canvas {
+            display: none;
         }
 
         .btn {
@@ -181,7 +195,7 @@
             <div id="productList"></div>
             
             <div id="scannerSection" style="display:none; margin-top:15px;">
-                <div id="reader"></div>
+                <div id="interactive" class="viewport"></div>
             </div>
 
             <button class="btn" id="btnScanToggle">Escanear por Cámara</button>
@@ -201,28 +215,33 @@
         </div>
     </div>
 
+    <!-- Modal Formulario para Producto Nuevo / Desconocido -->
+    <div id="customProductModal" class="modal">
+        <div class="modal-content">
+            <h3>➕ Artículo no encontrado</h3>
+            <p style="font-size: 12px; color: #888; margin-top: -5px;">Ingresa los datos manualmente para registrarlo</p>
+            
+            <input type="text" id="customName" class="manual-input" placeholder="Nombre (ej. Pepsi Retornable 2.5L)" style="width: 100%; margin-bottom: 8px; box-sizing: border-box;">
+            <input type="text" id="customBrand" class="manual-input" placeholder="Marca (ej. Pepsi)" style="width: 100%; margin-bottom: 8px; box-sizing: border-box;">
+            <input type="number" id="customQty" class="manual-input" placeholder="Cantidad" value="1" min="1" style="width: 100%; margin-bottom: 8px; box-sizing: border-box;">
+            
+            <label style="font-size: 12px; color: #aaa; display: block; text-align: left; margin: 5px 0 2px 2px;">Foto del producto:</label>
+            <input type="file" id="customImgInput" accept="image/*" capture="environment" style="width: 100%; font-size: 12px; color: #aaa; margin-bottom: 15px;">
+
+            <button class="btn" onclick="saveCustomProduct()">Guardar Artículo</button>
+            <button class="btn" style="background-color: #555;" onclick="closeCustomModal()">Cancelar</button>
+        </div>
+    </div>
+
     <script>
         let calendar;
         let selectedDateStr = "";
-        let html5QrcodeScanner = null;
+        let isScanning = false;
+        let nativeDetector = null;
+        let mediaStream = null;
+        let pendingBarcode = "";
 
-        const manifestData = {
-            "name": "Control de Caducidades",
-            "short_name": "Caducidades",
-            "start_url": "./",
-            "display": "standalone",
-            "background_color": "#121212",
-            "theme_color": "#ff4757",
-            "icons": [{"src": "https://cdn-icons-png.flaticon.com/512/3652/3652191.png", "sizes": "512x512", "type": "image/png"}]
-        };
-        const stringManifest = JSON.stringify(manifestData);
-        const blob = new Blob([stringManifest], {type: 'application/json'});
-        const manifestURL = URL.createObjectURL(blob);
-        const link = document.createElement('link');
-        link.rel = 'manifest';
-        link.href = manifestURL;
-        document.head.appendChild(link);
-
+        // Sonido Bip Nativo
         function playBeep() {
             try {
                 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -248,15 +267,16 @@
             });
             calendar.render();
             renderEvents();
-        });
 
-        function requestNotificationPermission() {
-            if ("Notification" in window) {
-                Notification.requestPermission().then(permission => {
-                    if (permission === "granted") alert("¡Notificaciones activadas!");
-                });
+            // Comprobar si el navegador soporta el motor de escaneo nativo del hardware
+            if ('BarcodeDetector' in window) {
+                BarcodeDetector.getSupportedFormats().then(formats => {
+                    if (formats.includes('ean_13') || formats.includes('upc_a')) {
+                        nativeDetector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128'] });
+                    }
+                }).catch(() => {});
             }
-        }
+        });
 
         function openDayActions(dateStr) {
             selectedDateStr = dateStr;
@@ -273,6 +293,10 @@
 
         function closeDetailModal() {
             document.getElementById('detailModal').style.display = 'none';
+        }
+
+        function closeCustomModal() {
+            document.getElementById('customProductModal').style.display = 'none';
         }
 
         function updateProductList() {
@@ -331,37 +355,98 @@
             }
         });
 
-        function startScanner() {
-            html5QrcodeScanner = new Html5Qrcode("reader");
-            const config = {
-                fps: 20,
-                qrbox: { width: 280, height: 120 },
-                formatsToSupport: [
-                    Html5QrcodeSupportedFormats.EAN_13,
-                    Html5QrcodeSupportedFormats.EAN_8,
-                    Html5QrcodeSupportedFormats.UPC_A,
-                    Html5QrcodeSupportedFormats.UPC_E,
-                    Html5QrcodeSupportedFormats.CODE_128
-                ]
-            };
+        // Inicio de Escáner Híbrido (Nativo de Hardware o Quagga2)
+        async function startScanner() {
+            if (isScanning) return;
+            isScanning = true;
 
-            html5QrcodeScanner.start(
-                { facingMode: "environment" },
-                config,
-                async (decodedText) => {
-                    playBeep();
-                    stopScanner();
-                    await processProductEntry(decodedText);
+            const container = document.getElementById('interactive');
+            container.innerHTML = "";
+
+            if (nativeDetector) {
+                // MÉTODO NATIVO (Hardware ultra rápido)
+                try {
+                    mediaStream = await navigator.mediaDevices.getUserMedia({
+                        video: { facingMode: { exact: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }
+                    }).catch(() => navigator.mediaDevices.getUserMedia({ video: true }));
+
+                    const video = document.createElement('video');
+                    video.srcObject = mediaStream;
+                    video.setAttribute("playsinline", "true");
+                    video.play();
+                    container.appendChild(video);
+
+                    const detectLoop = async () => {
+                        if (!isScanning) return;
+                        try {
+                            const barcodes = await nativeDetector.detect(video);
+                            if (barcodes.length > 0) {
+                                playBeep();
+                                const code = barcodes[0].rawValue;
+                                stopScanner();
+                                await processProductEntry(code);
+                                return;
+                            }
+                        } catch (e) {}
+                        if (isScanning) requestAnimationFrame(detectLoop);
+                    };
+                    requestAnimationFrame(detectLoop);
+                    return;
+                } catch (err) {
+                    // Si falla el acceso nativo cae al motor Quagga2
+                }
+            }
+
+            // MÉTODO FALLBACK (Quagga2 optimizado para códigos lineales)
+            Quagga.init({
+                inputStream: {
+                    name: "Live",
+                    type: "LiveStream",
+                    target: container,
+                    constraints: { facingMode: "environment", width: 1280, height: 720 }
                 },
-                () => {}
-            ).catch(() => alert("Otorga permisos a la cámara para escanear."));
+                decoder: {
+                    readers: ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader", "code_128_reader"],
+                    multiple: false
+                },
+                locate: true
+            }, function(err) {
+                if (err) {
+                    alert("Error al iniciar cámara: " + err);
+                    stopScanner();
+                    return;
+                }
+                Quagga.start();
+            });
+
+            Quagga.onDetected(onBarcodeDetected);
+        }
+
+        async function onBarcodeDetected(result) {
+            if (!isScanning) return;
+            const code = result.codeResult.code;
+            if (code) {
+                playBeep();
+                stopScanner();
+                await processProductEntry(code);
+            }
         }
 
         function stopScanner() {
+            isScanning = false;
             document.getElementById('scannerSection').style.display = 'none';
-            if (html5QrcodeScanner) {
-                html5QrcodeScanner.stop().then(() => html5QrcodeScanner = null).catch(() => {});
+
+            if (nativeDetector && mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
             }
+
+            try {
+                Quagga.offDetected(onBarcodeDetected);
+                Quagga.stop();
+            } catch (e) {}
+
+            document.getElementById('interactive').innerHTML = "";
         }
 
         async function handleManualSearch() {
@@ -384,17 +469,23 @@
             if (productData) {
                 let qtyInput = prompt(`Producto: "${productData.nombre}"\n¿Cuántas unidades deseas registrar?`, "1");
                 let cantidad = parseInt(qtyInput, 10);
-                
                 if (isNaN(cantidad) || cantidad <= 0) cantidad = 1;
 
                 saveItem(productData, barcode, cantidad);
+            } else {
+                pendingBarcode = barcode;
+                document.getElementById('customName').value = "";
+                document.getElementById('customBrand').value = "";
+                document.getElementById('customQty').value = "1";
+                document.getElementById('customImgInput').value = "";
+                document.getElementById('customProductModal').style.display = 'flex';
             }
         }
 
         async function fetchProductData(barcode) {
             try {
                 const response = await fetch(`https://world.openfoodfacts.org/api/v0/product/${barcode}.json`, {
-                    headers: { 'User-Agent': 'MiAppCaducidades - WebApp - Version 2.0' }
+                    headers: { 'User-Agent': 'MiAppCaducidades - WebApp - Version 3.0' }
                 });
                 const data = await response.json();
 
@@ -406,14 +497,35 @@
                         marca: p.brands || ""
                     };
                 } else {
-                    let nombreManual = prompt("Código no encontrado en la API. Escribe un nombre para este artículo:");
-                    if (!nombreManual) return null;
-                    return { nombre: nombreManual, foto: "", marca: "" };
+                    return null;
                 }
             } catch (error) {
-                let nombreManual = prompt("Sin conexión a la API. Escribe un nombre para este artículo:");
-                if (!nombreManual) return null;
-                return { nombre: nombreManual, foto: "", marca: "" };
+                return null;
+            }
+        }
+
+        function saveCustomProduct() {
+            const nombre = document.getElementById('customName').value.trim();
+            const marca = document.getElementById('customBrand').value.trim();
+            const cantidad = parseInt(document.getElementById('customQty').value, 10) || 1;
+            const fileInput = document.getElementById('customImgInput');
+
+            if (!nombre) {
+                alert("Por favor ingresa al menos el nombre del producto.");
+                return;
+            }
+
+            if (fileInput.files && fileInput.files[0]) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const base64Image = e.target.result;
+                    saveItem({ nombre: nombre, marca: marca, foto: base64Image }, pendingBarcode, cantidad);
+                    closeCustomModal();
+                };
+                reader.readAsDataURL(fileInput.files[0]);
+            } else {
+                saveItem({ nombre: nombre, marca: marca, foto: "" }, pendingBarcode, cantidad);
+                closeCustomModal();
             }
         }
 
